@@ -294,6 +294,11 @@ module Make (Io : IO) (Stream: Stream with type 'a io = 'a Io.t) = struct
     values  : 'a enum_value list;
   }
 
+  type 'ctx resolve_params = {
+    ctx : 'ctx;
+    field : Graphql_parser.field;
+  }
+
   type ('ctx, 'src) obj = {
     name   : string;
     doc    : string option;
@@ -307,7 +312,7 @@ module Make (Io : IO) (Stream: Stream with type 'a io = 'a Io.t) = struct
       deprecated : deprecated;
       typ        : ('ctx, 'out) typ;
       args       : ('a, 'args) Arg.arg_list;
-      resolve    : 'ctx -> 'src -> 'args;
+      resolve    : 'ctx resolve_params -> 'src -> 'args;
       lift       : 'a -> ('out, string) result Io.t;
     } -> ('ctx, 'src) field
   and (_, _) typ =
@@ -1152,7 +1157,11 @@ end
       let open Io.Infix in
       let name = alias_or_name query_field in
       let path' = (`String name)::path in
-      let resolver = field.resolve ctx.ctx src in
+      let resolve_params = {
+        ctx = ctx.ctx;
+        field = query_field;
+      } in
+      let resolver = field.resolve resolve_params src in
       match Arg.eval_arglist ctx.variables field.args query_field.arguments resolver with
       | Ok unlifted_value ->
           let lifted_value =
