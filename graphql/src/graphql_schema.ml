@@ -110,6 +110,7 @@ module Make (Io : IO) (Stream: Stream with type 'a io = 'a Io.t) = struct
       | Scalar : {
           name   : string;
           doc    : string option;
+          uncoerce: 'a -> Yojson.Basic.json;
           coerce : Graphql_parser.const_value -> ('a, string) result;
         } -> 'a option arg_typ
       | Object : {
@@ -147,8 +148,8 @@ module Make (Io : IO) (Stream: Stream with type 'a io = 'a Io.t) = struct
     let arg' ?doc name ~typ ~default =
       DefaultArg { name; doc; typ; default }
 
-    let scalar ?doc name ~coerce =
-      Scalar { name; doc; coerce }
+    let scalar ?doc name ~uncoerce ~coerce =
+      Scalar { name; doc; uncoerce; coerce }
 
     let enum ?doc name ~values =
       Enum { name; doc; values }
@@ -160,6 +161,7 @@ module Make (Io : IO) (Stream: Stream with type 'a io = 'a Io.t) = struct
     let int = Scalar {
       name = "Int";
       doc = None;
+      uncoerce = (fun n -> `Int n);
       coerce = function
         | `Int n -> Ok n
         | _ -> Error "Invalid int"
@@ -168,6 +170,7 @@ module Make (Io : IO) (Stream: Stream with type 'a io = 'a Io.t) = struct
     let string = Scalar {
       name = "String";
       doc = None;
+      uncoerce = (fun s -> `String s);
       coerce = function
         | `String s -> Ok s
         | _ -> Error "Invalid string"
@@ -176,6 +179,7 @@ module Make (Io : IO) (Stream: Stream with type 'a io = 'a Io.t) = struct
     let float = Scalar {
       name = "Float";
       doc = None;
+      uncoerce = (fun f -> `Float f);
       coerce = function
         | `Float f -> Ok f
         | `Int n -> Ok (float_of_int n)
@@ -185,6 +189,7 @@ module Make (Io : IO) (Stream: Stream with type 'a io = 'a Io.t) = struct
     let bool = Scalar {
       name = "Boolean";
       doc = None;
+      uncoerce = (fun b -> `Bool b);
       coerce = function
         | `Bool b -> Ok b
         | _ -> Error "Invalid boolean"
@@ -193,6 +198,7 @@ module Make (Io : IO) (Stream: Stream with type 'a io = 'a Io.t) = struct
     let guid = Scalar {
       name = "ID";
       doc = None;
+      uncoerce = (fun s -> `String s);
       coerce = function
         | `String s -> Ok s
         | `Int n -> Ok (string_of_int n)
@@ -709,7 +715,10 @@ module Introspection = struct
         typ = string;
         args = Arg.[];
         lift = Io.ok;
-        resolve = fun _ (AnyArg _) -> None
+        resolve = fun _ (AnyArg arg) -> match arg with
+          | Arg.DefaultArg { typ = Arg.Scalar { uncoerce; _ }; default; _ } ->
+              Some (Yojson.Basic.to_string (uncoerce default))
+          | _ -> None
       }
     ]
   }
