@@ -4,7 +4,7 @@ authors: "Andreas Garnaes <andreas.garnaes@gmail.com>"
 homepage: "https://github.com/andreas/ocaml-graphql-server"
 doc: "https://andreas.github.io/ocaml-graphql-server/"
 bug-reports: "https://github.com/andreas/ocaml-graphql-server/issues"
-dev-repo: "https://github.com/andreas/ocaml-graphql-server.git"
+dev-repo: "https://github.com/osener/ocaml-graphql-server.git"
 build: [["dune" "build" "-p" name "-j" jobs]]
 build-test: [["dune" "runtest" "-p" name "-j" jobs]]
 depends: [
