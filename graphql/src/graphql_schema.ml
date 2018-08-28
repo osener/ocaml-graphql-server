@@ -33,9 +33,18 @@ module type IO = sig
   val bind : 'a t -> ('a -> 'b t) -> 'b t
 end
 
+(* Stream *)
+module type Stream = sig
+  type +'a io
+  type 'a t
+
+  val map : 'a t -> ('a -> 'b io) -> 'b t
+end
+
 (* Schema *)
-module Make(Io : IO) = struct
+module Make (Io : IO) (Stream: Stream with type 'a io = 'a Io.t) = struct
   type +'a io = 'a Io.t
+  type 'a stream = 'a Stream.t
 
   module Io = struct
     include Io
@@ -237,7 +246,7 @@ module Make(Io : IO) = struct
               eval_arglist variable_map arglist' key_values (f coerced)
             with StringMap.Missing_key key -> Error (Format.sprintf "Missing variable `%s`" key)
 
-    and eval_arg : type a. variable_map ->  a arg_typ -> Graphql_parser.const_value option -> (a, string) result = fun variable_map typ value ->
+    and eval_arg : type a. variable_map -> a arg_typ -> Graphql_parser.const_value option -> (a, string) result = fun variable_map typ value ->
       match (typ, value) with
       | NonNullable _, None -> Error "Missing required argument"
       | NonNullable _, Some `Null -> Error "Missing required argument"
@@ -335,14 +344,36 @@ module Make(Io : IO) = struct
   and ('ctx, 'a) abstract_value =
     AbstractValue : ('ctx, 'src option) typ * 'src -> ('ctx, 'a) abstract_value
 
+  type 'ctx subscription_field =
+    SubscriptionField : {
+      name       : string;
+      doc        : string option;
+      deprecated : deprecated;
+      typ        : ('ctx, 'out) typ;
+      args       : (('out stream, string) result io, 'args) Arg.arg_list;
+      resolve    : 'ctx -> 'args;
+    } -> 'ctx subscription_field
+
+  type 'ctx subscription_obj = {
+    name   : string;
+    doc    : string option;
+    fields : 'ctx subscription_field list;
+  }
+
   type ('ctx, 'a) abstract_typ = ('ctx, ('ctx, 'a) abstract_value option) typ
 
   type 'ctx schema = {
     query : ('ctx, unit) obj;
     mutation : ('ctx, unit) obj option;
+    subscription : 'ctx subscription_obj option;
   }
 
-  let schema ?(mutation_name="mutation") ?mutations ?(query_name="query") fields = {
+  let schema ?(mutation_name="mutation")
+             ?mutations
+             ?(subscription_name="subscription")
+             ?subscriptions
+             ?(query_name="query")
+             fields = {
     query = {
       name = query_name;
       doc = None;
@@ -355,6 +386,13 @@ module Make(Io : IO) = struct
         doc = None;
         abstracts = ref [];
         fields = lazy fields;
+      }
+    );
+    subscription = Option.map subscriptions ~f:(fun fields ->
+      {
+        name = subscription_name;
+        doc = None;
+        fields;
       }
     )
   }
@@ -372,6 +410,9 @@ module Make(Io : IO) = struct
 
   let abstract_field ?doc ?(deprecated=NotDeprecated) name ~typ ~args =
     AbstractField (Field { lift = Io.ok; name; doc; deprecated; typ; args; resolve = Obj.magic () })
+
+  let subscription_field ?doc ?(deprecated=NotDeprecated) name ~typ ~args ~resolve =
+    SubscriptionField { name; doc; deprecated; typ; args; resolve }
 
   let enum ?doc name ~values =
     Enum { name; doc; values }
@@ -401,6 +442,14 @@ module Make(Io : IO) = struct
         fun src -> AbstractValue (typ, src)
     | _ ->
         invalid_arg "Arguments must be Interface/Union and Object"
+
+  let obj_of_subscription_obj {name; doc; fields} =
+    let fields = List.map
+      (fun (SubscriptionField {name; doc; deprecated; typ; args; resolve}) ->
+        Field { lift = Obj.magic (); name; doc; deprecated; typ; args; resolve = (fun ctx () -> resolve ctx) })
+      fields
+    in
+    { name; doc; abstracts = ref []; fields = lazy fields }
 
   (* Built-in scalars *)
   let int : 'ctx. ('ctx, int option) typ = Scalar {
@@ -920,10 +969,15 @@ module Introspection = struct
         args = Arg.[];
         lift = Io.ok;
         resolve = fun _ s ->
-          let query_types, visited = types (Object s.query) in
-          match s.mutation with
-          | None -> query_types
-          | Some mut -> fst @@ types ~memo:(query_types, visited) (Object mut)
+          let types, _ = List.fold_left
+            (fun memo op ->
+              match op with
+              | None -> memo
+              | Some op -> types ~memo (Object op))
+            ([], StringSet.empty)
+            [Some s.query; s.mutation; Option.map s.subscription obj_of_subscription_obj]
+          in
+          types
       };
       Field {
         name = "queryType";
@@ -944,6 +998,16 @@ module Introspection = struct
         resolve = fun _ s -> Option.map s.mutation ~f:(fun mut -> AnyTyp (Object mut))
       };
       Field {
+        name = "subscriptionType";
+        doc = None;
+        deprecated = NotDeprecated;
+        typ = __type;
+        args = Arg.[];
+        lift = Io.ok;
+        resolve = fun _ s ->
+          Option.map s.subscription ~f:(fun subs -> AnyTyp (Object (obj_of_subscription_obj subs)))
+      };
+      Field {
         name = "directives";
         doc = None;
         deprecated = NotDeprecated;
@@ -951,6 +1015,15 @@ module Introspection = struct
         args = Arg.[];
         lift = Io.ok;
         resolve = fun _ s -> []
+      };
+      Field {
+        name = "subscriptionType";
+        doc = None;
+        deprecated = NotDeprecated;
+        typ = __type;
+        args = Arg.[];
+        lift = Io.ok;
+        resolve = fun _ s -> None
       }
     ]
   }
@@ -980,11 +1053,31 @@ end
     ctx       : 'ctx;
   }
 
-  let matches_type_condition type_condition obj =
+  type path = [`String of string | `Int of int] list
+  type error = string * path
+
+  type resolve_error = [
+    | `Resolve_error of error
+    | `Argument_error of string
+    | `Validation_error of string
+  ]
+
+  type execute_error = [
+    resolve_error
+    | `Mutations_not_configured
+    | `Subscriptions_not_configured
+    | `No_operation_found
+    | `Operation_name_required
+    | `Operation_not_found
+  ]
+
+  type 'a response = ('a, Yojson.Basic.json) result
+
+  let matches_type_condition type_condition (obj : ('ctx, 'src) obj) =
     obj.name = type_condition ||
       List.exists (fun (abstract : abstract) -> abstract.name = type_condition) !(obj.abstracts)
 
-  let rec collect_fields : fragment_map -> ('ctx, 'src) obj -> Graphql_parser.selection list -> Graphql_parser.field list = fun fragment_map obj fields -> 
+  let rec collect_fields : fragment_map -> ('ctx, 'src) obj -> Graphql_parser.selection list -> Graphql_parser.field list = fun fragment_map obj fields ->
     List.map (function
     | Graphql_parser.Field field ->
         [field]
@@ -1013,7 +1106,10 @@ end
   let field_from_object : ('ctx, 'src) obj -> string -> ('ctx, 'src) field option = fun obj field_name ->
     List.find (fun (Field field) -> field.name = field_name) (Lazy.force obj.fields)
 
-  let coerce_or_null : 'a option -> ('a -> (Yojson.Basic.json * string list, 'b) result Io.t) -> (Yojson.Basic.json * string list, 'b) result Io.t =
+  let field_from_subscription_object = fun obj field_name ->
+    List.find (fun (SubscriptionField field) -> field.name = field_name) obj.fields
+
+  let coerce_or_null : 'a option -> ('a -> (Yojson.Basic.json * error list, 'b) result Io.t) -> (Yojson.Basic.json * error list, 'b) result Io.t =
     fun src f ->
       match src with
       | None -> Io.ok (`Null, [])
@@ -1023,22 +1119,36 @@ end
     | Serial -> Io.map_s ~memo:[]
     | Parallel -> Io.map_p
 
-  let rec present : type ctx src. ctx execution_context -> src -> Graphql_parser.field -> (ctx, src) typ -> (Yojson.Basic.json * string list, [`Argument_error of string | `Resolve_error of string]) result Io.t =
-    fun ctx src query_field typ ->
+  let error_to_json ?path msg =
+    let props = match path with
+    | Some path -> ["path", `List (List.rev path :> Yojson.Basic.json list)]
+    | None -> []
+    in
+    (`Assoc (("message", `String msg)::props) : Yojson.Basic.json)
+
+  let error_response ?path msg =
+    `Assoc [
+      "errors", `List [
+        error_to_json ?path msg
+      ]
+    ]
+
+  let rec present : type ctx src. ctx execution_context -> src -> Graphql_parser.field -> (ctx, src) typ -> path -> (Yojson.Basic.json * error list, [> resolve_error]) result Io.t =
+    fun ctx src query_field typ path ->
       match typ with
       | Scalar s -> coerce_or_null src (fun x -> Io.ok (s.coerce x, []))
       | List t ->
           coerce_or_null src (fun src' ->
-            List.map (fun x -> present ctx x query_field t) src'
+            List.mapi (fun i x -> present ctx x query_field t ((`Int i)::path)) src'
             |> Io.all
             |> Io.map ~f:List.Result.join
             |> Io.Result.map ~f:(fun xs -> (`List (List.map fst xs), List.map snd xs |> List.concat))
           )
-      | NonNullable t -> present ctx (Some src) query_field t
+      | NonNullable t -> present ctx (Some src) query_field t path
       | Object o ->
           coerce_or_null src (fun src' ->
             let fields = collect_fields ctx.fragments o query_field.selection_set in
-            resolve_fields ctx src' o fields
+            resolve_fields ctx src' o fields path
           )
       | Enum e ->
           coerce_or_null src (fun src' ->
@@ -1048,26 +1158,28 @@ end
           )
       | Abstract u ->
           coerce_or_null src (fun (AbstractValue (typ', src')) ->
-            present ctx (Some src') query_field typ'
+            present ctx (Some src') query_field typ' path
           )
 
-  and resolve_field : type ctx src. ctx execution_context -> src -> Graphql_parser.field -> (ctx, src) field -> ((string * Yojson.Basic.json) * string list, [`Argument_error of string | `Resolve_error of string]) result Io.t =
-    fun ctx src query_field (Field field) ->
+  and resolve_field : type ctx src. ctx execution_context -> src -> Graphql_parser.field -> (ctx, src) field -> path -> ((string * Yojson.Basic.json) * error list, [> resolve_error]) result Io.t =
+    fun ctx src query_field (Field field) path ->
       let open Io.Infix in
       let name = alias_or_name query_field in
+      let path' = (`String name)::path in
       let resolver = field.resolve ctx.ctx src in
       match Arg.eval_arglist ctx.variables field.args query_field.arguments resolver with
       | Ok unlifted_value ->
           let lifted_value =
             field.lift unlifted_value
-            |> Io.Result.map_error ~f:(fun err -> `Resolve_error err) >>=? fun resolved ->
-            present ctx resolved query_field field.typ
+            |> Io.Result.map_error ~f:(fun err -> `Resolve_error (err, path')) >>=? fun resolved ->
+            present ctx resolved query_field field.typ path'
           in
           lifted_value >>| (function
           | Ok (value, errors) ->
               Ok ((name, value), errors)
-          | Error (`Argument_error _) as err ->
-              err
+          | Error (`Argument_error _)
+          | Error (`Validation_error _) as error ->
+              error
           | Error (`Resolve_error err) as error ->
               match field.typ with
               | NonNullable _ ->
@@ -1078,48 +1190,108 @@ end
       | Error err ->
           Io.error (`Argument_error err)
 
-  and resolve_fields : type ctx src. ctx execution_context -> ?execution_order:execution_order -> src -> (ctx, src) obj -> Graphql_parser.field list -> (Yojson.Basic.json * string list, [`Argument_error of string | `Resolve_error of string]) result Io.t =
-    fun ctx ?execution_order:(execution_order=Parallel) src obj fields ->
+  and resolve_fields : type ctx src. ctx execution_context -> ?execution_order:execution_order -> src -> (ctx, src) obj -> Graphql_parser.field list -> path -> (Yojson.Basic.json * error list, [> resolve_error]) result Io.t =
+    fun ctx ?execution_order:(execution_order=Parallel) src obj fields path ->
       map_fields_with_order execution_order (fun (query_field : Graphql_parser.field) ->
+        let name = alias_or_name query_field in
         if query_field.name = "__typename" then
-          Io.ok ((alias_or_name query_field, `String obj.name), [])
+          Io.ok ((name, `String obj.name), [])
         else
           match field_from_object obj query_field.name with
           | Some field ->
-              resolve_field ctx src query_field field
+              resolve_field ctx src query_field field path
           | None ->
-              Io.ok ((alias_or_name query_field, `Null), [])
+              let err = Printf.sprintf "Field '%s' is not defined on type '%s'" query_field.name obj.name in
+              Io.error (`Validation_error err)
       ) fields
       |> Io.map ~f:List.Result.join
       |> Io.Result.map ~f:(fun xs -> (`Assoc (List.map fst xs), List.map snd xs |> List.concat))
 
-  type execute_error = [
-    | `Argument_error of string
-    | `Resolve_error of string
-    | `Validation_error of string
-    | `Mutations_not_configured
-    | `Subscriptions_not_implemented
-    | `No_operation_found
-    | `Operation_name_required
-    | `Operation_not_found
-  ]
+  let data_to_json = function
+    | data, [] -> `Assoc ["data", data]
+    | data, errors ->
+        let errors = List.map (fun (msg, path) -> error_to_json ~path msg) errors in
+        `Assoc [
+          "data", data;
+          "errors", `List errors
+        ]
 
-  let execute_operation : 'ctx schema -> 'ctx execution_context -> fragment_map -> variable_map -> Graphql_parser.operation -> (Yojson.Basic.json * string list, [> execute_error]) result Io.t =
+  let to_response = function
+    | Ok response as res -> res
+    | Error `No_operation_found ->
+        Error (error_response "No operation found")
+    | Error `Operation_not_found ->
+        Error (error_response "Operation not found")
+    | Error `Operation_name_required ->
+        Error (error_response "Operation name required")
+    | Error `Subscriptions_not_configured ->
+        Error (error_response "Subscriptions not configured")
+    | Error `Mutations_not_configured ->
+        Error (error_response "Mutations not configured")
+    | Error (`Validation_error msg) ->
+        Error (error_response msg)
+    | Error (`Argument_error msg) ->
+        let `Assoc errors = error_response msg in
+        Error (`Assoc (("data", `Null)::errors))
+    | Error (`Resolve_error (msg, path)) ->
+        let `Assoc errors = error_response ~path msg in
+        Error (`Assoc (("data", `Null)::errors))
+
+  let subscribe : type ctx. ctx execution_context -> ctx subscription_field -> Graphql_parser.field -> (Yojson.Basic.json response Stream.t, [> resolve_error]) result Io.t
+  =
+    fun ctx (SubscriptionField subs_field) field ->
+      let open Io.Infix in
+      let name = alias_or_name field in
+      let path = [`String name] in
+      let resolver = subs_field.resolve ctx.ctx in
+      match Arg.eval_arglist ctx.variables subs_field.args field.arguments resolver with
+      | Ok result ->
+          result
+          |> Io.Result.map ~f:(fun source_stream ->
+            Stream.map source_stream (fun value ->
+              present ctx value field subs_field.typ path
+              |> Io.Result.map ~f:(fun (data, errors) ->
+                data_to_json (`Assoc [name, data], errors)
+              )
+              >>| to_response
+            )
+          )
+          |> Io.Result.map_error ~f:(fun err ->
+            `Resolve_error (err, path)
+          )
+      | Error err -> Io.error (`Argument_error err)
+
+  let execute_operation : 'ctx schema -> 'ctx execution_context -> fragment_map -> variable_map -> Graphql_parser.operation -> ([ `Response of Yojson.Basic.json | `Stream of Yojson.Basic.json response stream], [> execute_error]) result Io.t =
     fun schema ctx fragments variables operation ->
       match operation.optype with
       | Graphql_parser.Query ->
           let query  = schema.query in
           let fields = collect_fields fragments query operation.selection_set in
-          (resolve_fields ctx () query fields : (Yojson.Basic.json * string list, [`Argument_error of string | `Resolve_error of string]) result Io.t :> (Yojson.Basic.json * string list, [> execute_error]) result Io.t)
+          (resolve_fields ctx () query fields [] : (Yojson.Basic.json * error list, resolve_error) result Io.t :> (Yojson.Basic.json * error list, [> execute_error]) result Io.t)
+          |> Io.Result.map ~f:(fun data_errs -> `Response (data_to_json data_errs))
       | Graphql_parser.Mutation ->
           begin match schema.mutation with
           | None -> Io.error `Mutations_not_configured
           | Some mut ->
               let fields = collect_fields fragments mut operation.selection_set in
-              (resolve_fields ~execution_order:Serial ctx () mut fields : (Yojson.Basic.json * string list, [`Argument_error of string | `Resolve_error of string]) result Io.t :> (Yojson.Basic.json * string list, [> execute_error]) result Io.t)
+              (resolve_fields ~execution_order:Serial ctx () mut fields [] : (Yojson.Basic.json * error list, resolve_error) result Io.t :> (Yojson.Basic.json * error list, [> execute_error]) result Io.t)
+              |> Io.Result.map ~f:(fun data_errs -> `Response (data_to_json data_errs))
           end
       | Graphql_parser.Subscription ->
-          Io.error `Subscriptions_not_implemented
+          begin match schema.subscription with
+          | None -> Io.error `Subscriptions_not_configured
+          | Some subs ->
+              begin match collect_fields fragments (obj_of_subscription_obj subs) operation.selection_set with
+              | [field] ->
+                  (match field_from_subscription_object subs field.name with
+                   | Some subscription_field ->
+                       (subscribe ctx subscription_field field : ((Yojson.Basic.json, Yojson.Basic.json) result Stream.t, resolve_error) result Io.t :> ((Yojson.Basic.json, Yojson.Basic.json) result Stream.t, [> execute_error]) result Io.t)
+                       |> Io.Result.map ~f:(fun stream -> `Stream stream)
+                   | None -> Io.ok (`Response (`Assoc [(alias_or_name field, `Null)])))
+              (* see http://facebook.github.io/graphql/June2018/#sec-Response-root-field *)
+              | _ -> Io.error (`Validation_error "Subscriptions only allow exactly one selection for the operation.")
+              end
+          end
 
   let collect_fragments doc =
     List.fold_left (fun memo -> function
@@ -1136,8 +1308,8 @@ end
       Ok fragment_map
     with FragmentCycle fragment_names ->
       let cycle = String.concat ", " fragment_names in
-      let msg = Format.sprintf "Fragment cycle detected: %s" cycle in
-      Error (`Validation_error msg)
+      let err = Format.sprintf "Fragment cycle detected: %s" cycle in
+      Error (`Validation_error err)
 
   and validate_fragment (fragment_map : fragment_map) visited name =
     match StringMap.find name fragment_map with
@@ -1179,16 +1351,6 @@ end
         with Not_found ->
           Error `Operation_not_found
 
-  let error_to_json err =
-    `Assoc ["message", `String err]
-
-  let error_response err =
-    `Assoc [
-      "errors", `List [
-        error_to_json err
-      ]
-    ]
-
   let execute schema ctx ?variables:(variables=[]) ?operation_name doc =
     let open Io.Infix in
     let execute' schema ctx doc =
@@ -1199,29 +1361,5 @@ end
       Io.return (select_operation ?operation_name doc) >>=? fun op ->
       execute_operation schema' execution_ctx fragments variables op
     in
-    execute' schema ctx doc >>| function
-    | Ok (data, []) ->
-        Ok (`Assoc ["data", data])
-    | Ok (data, errors) ->
-        let errors = List.map error_to_json errors in
-        Ok (`Assoc [
-          "data", data;
-          "errors", `List errors
-        ])
-    | Error `No_operation_found ->
-        Error (error_response "No operation found")
-    | Error `Operation_not_found ->
-        Error (error_response "Operation not found")
-    | Error `Operation_name_required ->
-        Error (error_response "Operation name required")
-    | Error `Subscriptions_not_implemented ->
-        Error (error_response "Subscriptions not implemented")
-    | Error `Mutations_not_configured ->
-        Error (error_response "Mutations not configured")
-    | Error `Validation_error err ->
-        Error (error_response err)
-    | Error (`Argument_error err)
-    | Error (`Resolve_error err) ->
-        let `Assoc errors = error_response err in
-        Error (`Assoc (("data", `Null)::errors))
+    execute' schema ctx doc >>| to_response
 end

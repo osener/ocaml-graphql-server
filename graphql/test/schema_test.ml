@@ -106,6 +106,26 @@ let suite = [
       ]
     ])
   );
+  ("undefined field on query root", `Quick, fun () ->
+    let query = "{ foo { bar } }" in
+    test_query query (`Assoc [
+      "errors", `List [
+        `Assoc [
+          "message", `String "Field 'foo' is not defined on type 'query'"
+        ]
+      ]
+    ])
+  );
+  ("undefined field on object type", `Quick, fun () ->
+    let query = "{ users { id foo } }" in
+    test_query query (`Assoc [
+      "errors", `List [
+        `Assoc [
+          "message", `String "Field 'foo' is not defined on type 'user'"
+        ]
+      ]
+    ])
+  );
   ("fragments cannot form cycles", `Quick, fun () ->
     let query = "
       fragment F1 on Foo {
@@ -234,4 +254,54 @@ let suite = [
         | Error err -> failwith (Yojson.Basic.pretty_to_string err)
         end
   );
+  ("subscription", `Quick, fun () ->
+    let query = "subscription { subscribe_to_user { id name } }" in
+    test_query query (`List [
+      `Assoc [
+        "data", `Assoc [
+          "subscribe_to_user", `Assoc [
+            "id", `Int 1;
+            "name", `String "Alice"
+          ];
+        ]
+      ]
+    ])
+  );
+  ("subscription returns an error", `Quick, fun () ->
+    let query = "subscription { subscribe_to_user(error: true) { id name } }" in
+    test_query query (`Assoc [
+      "data", `Null;
+      "errors", `List [
+        `Assoc [
+          "message", `String "stream error";
+          "path", `List [`String "subscribe_to_user"]
+        ]
+      ]
+    ])
+  );
+  ("subscriptions: exn inside the stream", `Quick, fun () ->
+    let query = "subscription { subscribe_to_user(raise: true) { id name } }" in
+    test_query query (`String "caught stream exn")
+  );
+  ("subscription returns more than one value", `Quick, fun () ->
+    let query = "subscription { subscribe_to_user(first: 2) { id name } }" in
+    test_query query (`List [
+      `Assoc [
+        "data", `Assoc [
+          "subscribe_to_user", `Assoc [
+            "id", `Int 1;
+            "name", `String "Alice"
+          ];
+        ]
+      ];
+      `Assoc [
+        "data", `Assoc [
+          "subscribe_to_user", `Assoc [
+            "id", `Int 2;
+            "name", `String "Bob"
+          ];
+        ]
+      ]
+    ])
+  )
 ]
