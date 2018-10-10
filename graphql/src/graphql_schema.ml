@@ -294,9 +294,12 @@ module Make (Io : IO) (Stream: Stream with type 'a io = 'a Io.t) = struct
     values  : 'a enum_value list;
   }
 
+  type fragment_map = Graphql_parser.fragment StringMap.t
   type 'ctx resolve_params = {
     ctx : 'ctx;
     field : Graphql_parser.field;
+    fragments : fragment_map;
+    variables : variable_map;
   }
 
   type ('ctx, 'src) obj = {
@@ -1036,7 +1039,6 @@ end
 
   (* Execution *)
   type variables = (string * Graphql_parser.const_value) list
-  type fragment_map = Graphql_parser.fragment StringMap.t
   type execution_order = Serial | Parallel
   type 'ctx execution_context = {
     variables : variable_map;
@@ -1160,6 +1162,8 @@ end
       let resolve_params = {
         ctx = ctx.ctx;
         field = query_field;
+        fragments = ctx.fragments;
+        variables = ctx.variables;
       } in
       let resolver = field.resolve resolve_params src in
       match Arg.eval_arglist ctx.variables field.args query_field.arguments resolver with
@@ -1241,6 +1245,8 @@ end
       let resolve_params = {
         ctx = ctx.ctx;
         field;
+        fragments = ctx.fragments;
+        variables = ctx.variables
       } in
       let resolver = subs_field.resolve resolve_params in
       match Arg.eval_arglist ctx.variables subs_field.args field.arguments resolver with
