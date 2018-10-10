@@ -343,7 +343,7 @@ module Make (Io : IO) (Stream: Stream with type 'a io = 'a Io.t) = struct
       deprecated : deprecated;
       typ        : ('ctx, 'out) typ;
       args       : (('out stream, string) result io, 'args) Arg.arg_list;
-      resolve    : 'ctx -> 'args;
+      resolve    : 'ctx resolve_params -> 'args;
     } -> 'ctx subscription_field
 
   type 'ctx subscription_obj = {
@@ -1238,7 +1238,11 @@ end
       let open Io.Infix in
       let name = alias_or_name field in
       let path = [`String name] in
-      let resolver = subs_field.resolve ctx.ctx in
+      let resolve_params = {
+        ctx = ctx.ctx;
+        field;
+      } in
+      let resolver = subs_field.resolve resolve_params in
       match Arg.eval_arglist ctx.variables subs_field.args field.arguments resolver with
       | Ok result ->
           result
